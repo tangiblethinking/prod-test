@@ -16,6 +16,11 @@ into prod-main as-is. The only differences from ATS-X2-prod (which uses `/job`) 
 | `vercel.json` | Rewrites `/jobs`, `/jobs/assets/*`, `/jobs/_serverFn/*`, `/jobs/__grok/*` and `/jobs/*` to the app's real files at the root. |
 | `src/components/support-bot.tsx` | Mascot video path `/jobs/mascot/...` (files in `public/` are not prefixed automatically). |
 
+Two extra `/jobs` fixes exist here that ATS-X2-prod-main does not have yet (both also work at `/`):
+
+- `src/components/search-app.tsx`: `companies.json` is loaded from `${import.meta.env.BASE_URL}companies.json` (= `/jobs/companies.json`) instead of `/companies.json`.
+- `server/middleware/grok-pwa.ts`: strips a `/jobs` (or old `/job`) prefix, so `/jobs/__grok/manifest.webmanifest` and `/jobs/?install=1` work.
+
 Rules when changing code here:
 
 - Do not edit the 4 settings above. They must stay identical to ATS-X2-prod-main.
