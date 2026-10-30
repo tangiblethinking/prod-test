@@ -2,7 +2,11 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { finalizeCleanHtml, stripMarkdownFences } from "@/lib/html-clean";
 import { extractTextSlots, injectTextSlots, parseRewrittenSlots, restoreOriginalUrls, humanizeOutput } from "@/lib/html-text-slots";
-import type { AuditResult, KeywordSet } from "@/lib/pipeline-types";
+import type { AuditFlag, AuditResult, KeywordSet, ScoreReport } from "@/lib/pipeline-types";
+import { auditFacts, readBlocks, replaceBlocks, validateBold } from "@/lib/bold-check";
+import { fixBlocksSchema, GEMINI_FIX_BLOCKS_SCHEMA, GEMINI_SCORE_SCHEMA, parseScoreReport } from "@/lib/score-schema";
+import scoringPrompt from "@/lib/scoring-prompt.txt?raw";
+import fullRewritePrompt from "@/lib/full-rewrite-prompt.txt?raw";
 import { MAX_JOB_CHARS, MAX_RESUME_CHARS } from "@/lib/pipeline-types";
 import systemPrompt from "@/lib/system-prompt.txt?raw";
 import customizeHardRules from "@/lib/customize-hard-rules.txt?raw";
@@ -62,9 +66,6 @@ function summaryQualityOk(html: string): { ok: boolean; reason: string } {
     if (/^[a-z]/.test(s)) return { ok: false, reason: "sentence does not start with capital letter" };
     if (gerundStart.test(s)) return { ok: false, reason: "sentence starts with a gerund fragment (e.g. Eliminating...)" };
     if (/\bspecializes in\b/i.test(s)) return { ok: false, reason: "avoids 'Specializes in' construction" };
-    if (/\b(leader|designer|architect|manager|director)\b/i.test(s) && !/\byears\b/i.test(s)) {
-      return { ok: false, reason: "summary contains a job title" };
-    }
   }
 
   if (!/\d+\+\s*years/i.test(summary)) return { ok: false, reason: "summary must open with X+ years" };
@@ -98,21 +99,73 @@ export function sanitizeHtml(html: string): string {
   out = out.replace(/<\/strong>\s*\./g, ".</strong>");
   out = out.replace(/<strong>\s*<\/strong>/g, "");
   out = out.replace(/<b>\s*<\/b>/g, "");
-  out = out.replace(/<strong>([^<]{1,40}):<\/strong>\s*<strong>([^<]{1,80})<\/strong>/gi, "<strong>$2</strong>");
-  out = out.replace(/<strong>([^<]+)<\/strong>\s*<strong>([^<]+)<\/strong>/gi, "<strong>$1 $2</strong>");
+  // Adjacent <strong> tags are left alone: the dual-anchor bold rule needs a
+  // separate lead-in and separate bold numbers, so they must not be merged.
   out = out.replace(/\s{2,}/g, " ");
   return out.trim();
 }
 
-async function chat(opts: { apiKey: string; user: string; maxTokens: number; temperature: number; json?: boolean }) {
+async function chat(opts: {
+  apiKey: string;
+  user: string;
+  maxTokens: number;
+  temperature: number;
+  json?: boolean;
+  /** Replaces the default system prompt (the new scoring / rewrite steps use their own). */
+  system?: string;
+  responseSchema?: Record<string, unknown>;
+  timeoutMs?: number;
+  deadlineMs?: number;
+}) {
   const { geminiChat } = await import("./gemini.server");
   return geminiChat({
     apiKey: opts.apiKey,
-    messages: [{ role: "system", content: SYSTEM }, { role: "user", content: opts.user }],
+    messages: [{ role: "system", content: opts.system ?? SYSTEM }, { role: "user", content: opts.user }],
     maxTokens: opts.maxTokens,
     temperature: opts.temperature,
     json: opts.json,
+    responseSchema: opts.responseSchema,
+    timeoutMs: opts.timeoutMs,
+    deadlineMs: opts.deadlineMs,
   });
+}
+
+/**
+ * JSON call with one retry when the answer is not valid JSON (or fails the
+ * check). Errors are returned, never swallowed.
+ */
+async function chatJson<T>(
+  label: string,
+  opts: Parameters<typeof chat>[0],
+  parse: (raw: unknown) => T,
+  attempts = 2,
+): Promise<{ ok: true; value: T; log: string } | { ok: false; error: string; log: string }> {
+  const { parseJsonObject } = await import("./gemini.server");
+  let lastError = `${label} failed.`;
+  const logs: string[] = [];
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const result = await chat({
+      ...opts,
+      json: true,
+      user: attempt === 1 ? opts.user : `${opts.user}\n\nYour previous answer was not valid JSON in the required shape. Return only the JSON object.`,
+    });
+    if (!result.ok) {
+      logs.push(formatChatLog(label, result, `attempt=${attempt}`));
+      // Rate limit / auth / timeout already went through every model: do not hammer again.
+      return { ok: false, error: result.error, log: logs.join("\n") };
+    }
+    try {
+      const value = parse(parseJsonObject(result.text));
+      logs.push(formatChatLog(label, result, `attempt=${attempt}`));
+      return { ok: true, value, log: logs.join("\n") };
+    } catch {
+      lastError = result.meta.finishReason === "MAX_TOKENS"
+        ? `${label}: the answer was cut off at the output limit, so the JSON was incomplete.`
+        : `${label}: the model did not return valid JSON in the required shape.`;
+      logs.push(formatChatLog(label, result, `attempt=${attempt} invalid-json`));
+    }
+  }
+  return { ok: false, error: `${lastError} (tried ${attempts} times)`, log: logs.join("\n") };
 }
 
 export const verifyApiKey = createServerFn({ method: "POST" })
@@ -137,54 +190,48 @@ export const fetchJobDescription = createServerFn({ method: "POST" })
 export const analyzeIntent = createServerFn({ method: "POST" })
   .validator(z.object({ apiKey: apiKeySchema, jobText: z.string().trim().min(40).max(MAX_JOB_CHARS) }))
   .handler(async ({ data }) => {
-    const result = await chat({
-      apiKey: data.apiKey, json: true, maxTokens: 4000, temperature: 0.2,
+    const r = await chatJson("analyzeIntent", {
+      apiKey: data.apiKey, maxTokens: 16384, temperature: 0.2,
       user: `Analyze this job description. Describe in clear plain language what the role is actually looking for in a candidate. Return JSON only: {"intent":"...","priorities":["..."]}.\n\nJOB:\n${data.jobText}`,
+    }, (raw) => {
+      const o = (raw && typeof raw === "object" ? raw : {}) as { intent?: unknown; priorities?: unknown };
+      const intent = typeof o.intent === "string" ? o.intent.trim() : "";
+      if (!intent) throw new Error("no intent");
+      const priorities = Array.isArray(o.priorities) ? o.priorities.filter((x): x is string => typeof x === "string") : [];
+      return { intent, priorities };
     });
-    if (!result.ok) return result;
-    try {
-      const { parseJsonObject } = await import("./gemini.server");
-      const parsed = parseJsonObject(result.text) as any;
-      return { ok: true as const, intent: parsed.intent || "", priorities: parsed.priorities || [], log: formatChatLog("analyzeIntent", result) };
-    } catch {
-      return { ok: false as const, error: "Intent analysis did not return valid JSON." };
-    }
+    if (!r.ok) return { ok: false as const, error: r.error, log: r.log };
+    return { ok: true as const, intent: r.value.intent, priorities: r.value.priorities, log: r.log };
   });
 
 export const extractKeywords = createServerFn({ method: "POST" })
   .validator(z.object({ apiKey: apiKeySchema, jobText: z.string().trim().min(40).max(MAX_JOB_CHARS) }))
   .handler(async ({ data }) => {
-    const result = await chat({
-      apiKey: data.apiKey, json: true, maxTokens: 8000, temperature: 0.15,
+    const r = await chatJson("extractKeywords", {
+      apiKey: data.apiKey, maxTokens: 16384, temperature: 0.15,
       user: `Extract ATS keywords and phrases from this job description. Return JSON only: {"keywords":[],"phrases":[],"must_have":[],"nice_to_have":[]}. Do not invent terms.\n\nJOB:\n${data.jobText}`,
+    }, (raw) => {
+      const keywords = asKeywords(raw);
+      if (keywords.keywords.length + keywords.phrases.length + keywords.must_have.length === 0) throw new Error("empty");
+      return keywords;
     });
-    if (!result.ok) return result;
-    try {
-      const { parseJsonObject } = await import("./gemini.server");
-      const keywords = asKeywords(parseJsonObject(result.text));
-      const log = formatChatLog("extractKeywords", result, `kw=${keywords.keywords.length + keywords.phrases.length}`);
-      if (keywords.keywords.length + keywords.phrases.length === 0) return { ok: false as const, error: "No keywords extracted.", log };
-      return { ok: true as const, keywords, log };
-    } catch {
-      return { ok: false as const, error: "Keyword extraction did not return valid JSON." };
-    }
+    if (!r.ok) return { ok: false as const, error: r.error, log: r.log };
+    return { ok: true as const, keywords: r.value, log: `${r.log} | kw=${r.value.keywords.length + r.value.phrases.length}` };
   });
 
 export const analyzeResume = createServerFn({ method: "POST" })
   .validator(z.object({ apiKey: apiKeySchema, resumeHtml: resumeSchema }))
   .handler(async ({ data }) => {
-    const result = await chat({
-      apiKey: data.apiKey, json: true, maxTokens: 6000, temperature: 0.15,
-      user: `Extract the key factual information from this resume HTML. Return JSON only: {"summary":"...","roles":[{"title":"...","company":"...","dates":"...","bullets":["..."]}],"skills":["..."],"education":"..."}. Do not invent anything.\n\nRESUME:\n${data.resumeHtml}`,
+    const r = await chatJson("analyzeResume", {
+      apiKey: data.apiKey, maxTokens: 24576, temperature: 0.15,
+      user: `Extract the key factual information from this resume HTML. Return JSON only: {"summary":"...","roles":[{"title":"...","company":"...","dates":"...","bullets":["..."]}],"skills":["..."],"education":"...","certifications":["..."],"metrics":["every number, percentage, dollar amount and count in the resume, with what it measures"]}. Copy wording exactly. Do not invent anything.\n\nRESUME:\n${data.resumeHtml}`,
+    }, (raw) => {
+      if (!raw || typeof raw !== "object") throw new Error("not an object");
+      // Compact JSON text: serializable across the server-function boundary.
+      return JSON.stringify(raw);
     });
-    if (!result.ok) return result;
-    try {
-      const { parseJsonObject } = await import("./gemini.server");
-      const parsed = parseJsonObject(result.text);
-      return { ok: true as const, analysis: parsed, log: formatChatLog("analyzeResume", result) };
-    } catch {
-      return { ok: false as const, error: "Resume analysis did not return valid JSON." };
-    }
+    if (!r.ok) return { ok: false as const, error: r.error, log: r.log };
+    return { ok: true as const, analysis: r.value, log: r.log };
   });
 
 export const rewriteResume = createServerFn({ method: "POST" })
@@ -210,7 +257,7 @@ export const rewriteResume = createServerFn({ method: "POST" })
       attempts++;
       const result = await chat({
         apiKey: data.apiKey, json: true, maxTokens: 8192, temperature: 0.4,
-        user: `REWRITE (attempt ${attempts}): Inject job keywords and phrases into existing resume language. Target 97% coverage, minimum 77%.\n\nReturn JSON only: { "slots": [ { "id": "t0", "text": "..." } ] }\n\nRules:\n- Plain text only, no HTML tags.\n- Do not invent new employers, titles, dates, metrics, or tools.\n- Stretching the truth is acceptable when it maps to existing work.\n- Summary must open with calculated "X+ years", use present tense only, contain no job titles, and be 2–3 complete sentences that each start with a capital letter.\n- Never start a summary sentence with a gerund (no "Eliminating...", "Accelerating...").\n- Never use "Specializes in".\n- Leave names, dates, phones, emails, companies unchanged.\n\nMUST-PLACE: ${must || "(none)"}\nPHRASES: ${phrases || "(none)"}\nOTHER: ${other || "(none)"}\n\nSLOTS:\n${JSON.stringify(slots)}`,
+        user: `REWRITE (attempt ${attempts}): Inject job keywords and phrases into existing resume language. Target 97% coverage, minimum 77%.\n\nReturn JSON only: { "slots": [ { "id": "t0", "text": "..." } ] }\n\nRules:\n- Plain text only, no HTML tags.\n- Do not invent new employers, titles, dates, metrics, or tools.\n- Summary must open with calculated "X+ years", use present tense only, contain no job titles, and be 2–3 complete sentences that each start with a capital letter.\n- Never start a summary sentence with a gerund (no "Eliminating...", "Accelerating...").\n- Never use "Specializes in".\n- Leave names, dates, phones, emails, companies unchanged.\n\nMUST-PLACE: ${must || "(none)"}\nPHRASES: ${phrases || "(none)"}\nOTHER: ${other || "(none)"}\n\nSLOTS:\n${JSON.stringify(slots)}`,
       });
       if (!result.ok) {
         if (attempts === maxAttempts) return result;
@@ -365,7 +412,8 @@ export const auditAndQA = createServerFn({ method: "POST" })
     try {
       const { parseJsonObject } = await import("./gemini.server");
       const parsed = parseJsonObject(result.text) as any;
-      const html = sanitizeHtml(typeof parsed.html === "string" && parsed.html.trim() ? parsed.html : data.currentHtml);
+      // Flags only: the audit never rewrites the document.
+      const html = data.currentHtml;
       const flags = Array.isArray(parsed.flags) ? parsed.flags : [];
       return { ok: true as const, html, flags, log: formatChatLog("audit", result) };
     } catch {
@@ -642,3 +690,185 @@ Rules:
     }
     return { ok: true as const, reply: result.text.trim(), images: previewUrls };
   });
+
+/* ───────────── Scoring + full rewrite path (steps 5–8) ───────────── */
+
+const keywordSetSchema = z.object({
+  keywords: z.array(z.string()).max(250),
+  phrases: z.array(z.string()).max(250),
+  must_have: z.array(z.string()).max(250),
+  nice_to_have: z.array(z.string()).max(250),
+});
+
+const jobTextSchema = z.string().trim().min(40).max(MAX_JOB_CHARS);
+
+/** Split a full HTML document into the part up to <body>, the body content, and the rest. */
+export function splitBody(html: string): { before: string; inner: string; after: string } {
+  const open = html.match(/<body\b[^>]*>/i);
+  const closeIdx = html.search(/<\/body>/i);
+  if (!open || open.index === undefined || closeIdx < 0) return { before: "", inner: html, after: "" };
+  const start = open.index + open[0].length;
+  return { before: html.slice(0, start), inner: html.slice(start, closeIdx), after: html.slice(closeIdx) };
+}
+
+/** sanitizeHtml on the body only, so <head> CSS is never touched. */
+function sanitizeBody(html: string): string {
+  const { before, inner, after } = splitBody(html);
+  return before ? `${before}\n${sanitizeHtml(inner)}\n${after}` : sanitizeHtml(html);
+}
+
+/** Step 5 and step 8: five scores, 0–10 with one decimal, facts and every suggestion. */
+export const scoreResume = createServerFn({ method: "POST" })
+  .validator(z.object({
+    apiKey: apiKeySchema,
+    which: z.enum(["before", "after"]),
+    slice: z.object({
+      jobText: jobTextSchema,
+      intent: z.string().max(8000),
+      priorities: z.array(z.string()).max(60),
+      keywords: keywordSetSchema,
+      documentHtml: resumeSchema,
+      originalHtml: z.string().max(MAX_RESUME_CHARS).optional(),
+    }),
+  }))
+  .handler(async ({ data }) => {
+    const s = data.slice;
+    const user = `JOB:
+${s.jobText}
+
+INTENT:
+${s.intent || "(not available)"}
+
+PRIORITIES:
+${s.priorities.map((p, i) => `${i + 1}. ${p}`).join("\n") || "(none)"}
+
+KEYWORDS:
+${JSON.stringify(s.keywords)}
+
+DOCUMENT:
+${s.documentHtml}${s.originalHtml ? `\n\nDOCUMENT_ORIGINAL:\n${s.originalHtml}` : ""}`;
+    const label = data.which === "before" ? "scoreOriginal" : "scoreRewrite";
+    const r = await chatJson<ScoreReport>(label, {
+      apiKey: data.apiKey,
+      system: scoringPrompt,
+      user,
+      maxTokens: 32768,
+      temperature: 0.1,
+      responseSchema: GEMINI_SCORE_SCHEMA,
+      timeoutMs: 120_000,
+      deadlineMs: 240_000,
+    }, parseScoreReport);
+    if (!r.ok) return { ok: false as const, error: r.error, log: r.log };
+    return { ok: true as const, report: r.value, log: r.log };
+  });
+
+/** Step 6: rewrite the whole document from the run memory. HTML in, HTML out. */
+export const fullRewrite = createServerFn({ method: "POST" })
+  .validator(z.object({
+    apiKey: apiKeySchema,
+    slice: z.object({
+      originalHtml: resumeSchema,
+      jobText: jobTextSchema,
+      intent: z.string().max(8000),
+      priorities: z.array(z.string()).max(60),
+      keywords: keywordSetSchema,
+      resumeFacts: z.string().max(30_000),
+      beforeScores: z.record(z.string(), z.object({ score: z.number(), facts: z.array(z.string()) })),
+      suggestions: z.array(z.string().max(2000)).max(250),
+    }),
+  }))
+  .handler(async ({ data }) => {
+    const s = data.slice;
+    const { before, inner, after } = splitBody(s.originalHtml);
+    const user = `JOB:
+${s.jobText}
+
+INTENT:
+${s.intent || "(not available)"}
+
+PRIORITIES:
+${s.priorities.map((p, i) => `${i + 1}. ${p}`).join("\n") || "(none)"}
+
+KEYWORDS:
+${JSON.stringify(s.keywords)}
+
+RESUME_FACTS:
+${s.resumeFacts || "(not available; use ORIGINAL_BODY_HTML)"}
+
+BEFORE_SCORES:
+${JSON.stringify(s.beforeScores)}
+
+SCORE_SUGGESTIONS:
+${s.suggestions.map((x, i) => `${i + 1}. ${x}`).join("\n") || "(none)"}
+
+ORIGINAL_BODY_HTML:
+${inner}`;
+    const logs: string[] = [];
+    let lastError = "Rewrite failed.";
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const result = await chat({
+        apiKey: data.apiKey,
+        system: fullRewritePrompt,
+        user,
+        maxTokens: 49152,
+        temperature: 0.4,
+        timeoutMs: 160_000,
+        deadlineMs: attempt === 1 ? 250_000 : 120_000,
+      });
+      logs.push(formatChatLog("fullRewrite", result, `attempt=${attempt}`));
+      if (!result.ok) return { ok: false as const, error: result.error, log: logs.join("\n") };
+      if (result.meta.finishReason === "MAX_TOKENS") { lastError = "The rewrite was cut off at the output limit."; continue; }
+      const body = stripMarkdownFences(result.text).replace(/<\/?(html|head|body)\b[^>]*>/gi, "").replace(/<!DOCTYPE[^>]*>/gi, "").trim();
+      if (!/<[a-z][^>]*>/i.test(body)) { lastError = "The rewrite did not come back as HTML."; continue; }
+      if (body.length < inner.trim().length * 0.5) { lastError = "The rewrite came back less than half the length of the original."; continue; }
+      const assembled = before ? `${before}\n${sanitizeHtml(body)}\n${after}` : finalizeCleanHtml(s.originalHtml, sanitizeHtml(body));
+      const hrefCount = (h: string) => (h.match(/\s(?:href|src)=/gi) || []).length;
+      const html = hrefCount(assembled) === hrefCount(s.originalHtml) ? restoreOriginalUrls(s.originalHtml, assembled) : assembled;
+      return { ok: true as const, html, log: logs.join("\n") };
+    }
+    return { ok: false as const, error: `${lastError} (tried 2 times; the original was kept and nothing was changed)`, log: logs.join("\n") };
+  });
+
+/** Step 7 repair: the model rewrites ONLY the lines that failed the code check. */
+export const fixBoldBlocks = createServerFn({ method: "POST" })
+  .validator(z.object({ apiKey: apiKeySchema, html: resumeSchema }))
+  .handler(async ({ data }) => {
+    const check = validateBold(data.html);
+    if (check.ok) return { ok: true as const, html: data.html, fixed: 0, log: "[fixBoldBlocks] nothing to fix" };
+    const failing = check.failures.slice(0, 80);
+    const problemsByIndex = new Map(failing.map((f) => [f.index, f.problems]));
+    const blocks = readBlocks(data.html, failing.map((f) => f.index)).map((b) => ({
+      index: b.index,
+      html: b.html,
+      problems: problemsByIndex.get(b.index) ?? [],
+    }));
+    const r = await chatJson("fixBoldBlocks", {
+      apiKey: data.apiKey,
+      system: `${fullRewritePrompt}\n\n# THIS TASK OVERRIDES THE OUTPUT AND SCOPE SECTIONS ABOVE\nYou are repairing single lines, not the whole document. Return JSON only, in the shape given in the user message.`,
+      user: `Fix ONLY these lines so each one passes the DUAL-ANCHOR BOLD RULE and clears every listed problem. Keep every fact, number and link. Change wording only where needed. "index" must be copied unchanged.
+Return JSON only: {"blocks":[{"index":0,"html":"new inner HTML of the line"}]}
+
+LINES:
+${JSON.stringify(blocks)}`,
+      maxTokens: 24576,
+      temperature: 0.2,
+      responseSchema: GEMINI_FIX_BLOCKS_SCHEMA,
+      timeoutMs: 90_000,
+      deadlineMs: 150_000,
+    }, (raw) => fixBlocksSchema.parse(raw));
+    if (!r.ok) return { ok: false as const, error: r.error, log: r.log };
+    const allowed = new Set(blocks.map((b) => b.index));
+    const map = new Map<number, string>();
+    for (const b of r.value.blocks) {
+      // Never let a "fix" smuggle in new block or structure tags.
+      if (allowed.has(b.index) && !/<\/?(li|p|ul|ol|div|section|h[1-6]|td|tr|table|dd|dl|body|html|head|script|style)\b/i.test(b.html)) {
+        map.set(b.index, sanitizeHtml(b.html));
+      }
+    }
+    return { ok: true as const, html: replaceBlocks(data.html, map), fixed: map.size, log: `${r.log} | fixed=${map.size}/${blocks.length}` };
+  });
+
+/** Code-only fact check of the rewrite against the original (numbers and headings). */
+export function factFlags(originalHtml: string, rewrittenHtml: string): AuditFlag[] {
+  return auditFacts(originalHtml, rewrittenHtml);
+}

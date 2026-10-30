@@ -58,15 +58,14 @@ export function restoreOriginalUrls(originalHtml: string, resultHtml: string): s
 
 /**
  * Deterministic cleanup so AI tells cannot survive the model:
- * - drop placeholder tokens (X+ years, [X], {{...}})
- * - unwrap <strong> around metrics so bold is not a repeating pattern
+ * - drop placeholder tokens ([X], {{...}})
+ * Bold around numbers is kept: the dual-anchor rule requires it.
+ * A literal "X+ years" is left in place so validateBold flags it for repair.
  */
 export function humanizeOutput(html: string): string {
   let out = html;
-  out = out.replace(/\bX\+\s*years?\b/gi, "");
   out = out.replace(/\[[A-Za-z0-9_+\s]{1,20}\]/g, "");
   out = out.replace(/\{\{[^}]+\}\}/g, "");
-  out = out.replace(/<(strong|b)>([^<]*\d+[^<]*)<\/\1>/gi, "$2");
   out = out.replace(/\s{2,}/g, " ");
   out = out.replace(/\s+([.,;:])/g, "$1");
   return out;

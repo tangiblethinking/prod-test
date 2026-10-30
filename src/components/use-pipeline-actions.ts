@@ -1,26 +1,26 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { isPlausibleApiKey } from "@/lib/api-key-store";
 import { looksLikeHtml } from "@/lib/html-clean";
 import {
   analyzeIntent,
   analyzeResume,
-  auditAndQA,
-  cleanHtml,
   customizeResume,
   extractKeywords,
   fetchJobDescription,
+  fixBoldBlocks,
+  fullRewrite,
   generateCoverLetter,
-  naturalLanguagePass,
-  rewriteResume,
-  scannabilityPass,
-  terminologyPass,
+  scoreResume,
 } from "@/lib/optimize";
+import { createRunMemory, memoryToAudit } from "@/lib/run-memory";
+import { runScoreRewriteSteps, type RunStepDeps } from "@/lib/run-steps";
 import type { JobResult } from "@/lib/job-search";
 import {
   MAX_JOB_CHARS,
   type AuditResult,
   type KeywordSet,
+  type RunMemory,
   type StepId,
   type StepStatus,
 } from "@/lib/pipeline-types";
@@ -76,6 +76,18 @@ export function usePipelineActions(opts: {
     setPipelineLog((prev) => [...prev, line]);
   }, [setPipelineLog]);
 
+  /** Run memory: created at the start of each run, kept for the Rewrite button. */
+  const memoryRef = useRef<RunMemory | null>(null);
+
+  const stepDeps = useCallback((markFn: RunStepDeps["mark"], pause?: () => Promise<void>): RunStepDeps => ({
+    score: (which, slice) => scoreResume({ data: { apiKey, which, slice } }),
+    rewrite: (slice) => fullRewrite({ data: { apiKey, slice } }),
+    fixBold: (html) => fixBoldBlocks({ data: { apiKey, html } }),
+    mark: markFn,
+    log: addLog,
+    pause,
+  }), [apiKey, addLog]);
+
   const toastBusy = useCallback(() => {
     toast.message("Please wait", {
       description: "A task is still running. Finish it before starting a new one.",
@@ -90,6 +102,7 @@ export function usePipelineActions(opts: {
     setFinalHtml(null);
     setCoverHtml(null);
     setPipelineLog?.(() => []);
+    memoryRef.current = null;
   }, [setStatuses, setDetails, setKeywords, setAudit, setFinalHtml, setCoverHtml, idleStatuses, setPipelineLog]);
 
   const runPipeline = useCallback(async (runOpts?: { url?: string; skipResetUrl?: boolean }) => {
@@ -107,7 +120,6 @@ export function usePipelineActions(opts: {
     resetPipeline();
     const original = resumeHtml.trim();
     let currentJob = jobText.trim();
-    let currentHtml = original;
     let currentKeywords: KeywordSet | null = null;
 
     try {
@@ -126,20 +138,27 @@ export function usePipelineActions(opts: {
       mark(1, "done", `${currentJob.length.toLocaleString()} characters collected`);
       await sleep(BRIEF_CHECK_MS);
 
+      // Run memory: one object for the whole run, filled step by step.
+      const mem = createRunMemory({ originalHtml: original, jobUrl: urlToUse, jobText: currentJob });
+      memoryRef.current = mem;
+
       // 2. Intent & Analysis
       mark(2, "running", "Analyzing what the job is looking for…");
       const intentResult = await analyzeIntent({ data: { apiKey, jobText: currentJob } });
-      addLog((intentResult as any).log);
+      addLog(intentResult.log);
       if (!intentResult.ok) { fail(2, intentResult.error); return; }
-      mark(2, "done", (intentResult as any).intent?.slice(0, 120) || "Intent analyzed");
+      mem.intent = intentResult.intent;
+      mem.priorities = intentResult.priorities;
+      mark(2, "done", intentResult.intent.slice(0, 120) || "Intent analyzed");
       await sleep(BRIEF_CHECK_MS);
 
       // 3. Keyword & Phrase Extraction
       mark(3, "running", "Extracting keywords and phrases…");
       const extracted = await extractKeywords({ data: { apiKey, jobText: currentJob } });
-      addLog((extracted as any).log);
+      addLog(extracted.log);
       if (!extracted.ok) { fail(3, extracted.error); return; }
       currentKeywords = extracted.keywords;
+      mem.keywords = currentKeywords;
       setKeywords(currentKeywords);
       mark(3, "done", `${currentKeywords.keywords.length + currentKeywords.phrases.length} keywords / phrases extracted`);
       await sleep(BRIEF_CHECK_MS);
@@ -147,103 +166,59 @@ export function usePipelineActions(opts: {
       // 4. Resume Analysis
       mark(4, "running", "Extracting all information from the resume…");
       const resumeAnalysis = await analyzeResume({ data: { apiKey, resumeHtml: original } });
-      addLog((resumeAnalysis as any).log);
+      addLog(resumeAnalysis.log);
       if (!resumeAnalysis.ok) { fail(4, resumeAnalysis.error); return; }
+      mem.resume_facts = resumeAnalysis.analysis;
       mark(4, "done", "Resume facts extracted");
       await sleep(BRIEF_CHECK_MS);
 
-      // 5. Keyword Injection Rewrite
-      mark(5, "running", "Injecting keywords into existing language…");
-      const rewritten = await rewriteResume({ data: { apiKey, resumeHtml: original, keywords: currentKeywords } });
-      addLog((rewritten as any).log);
-      if (!rewritten.ok) { fail(5, rewritten.error); return; }
-      currentHtml = rewritten.html;
-      mark(5, "done", "Keywords woven into existing content");
-      await sleep(BRIEF_CHECK_MS);
-
-      // 6. Terminology Accuracy Pass
-      mark(6, "running", "Checking technical accuracy…");
-      const term = await terminologyPass({ data: { apiKey, originalHtml: original, draftHtml: currentHtml } });
-      addLog((term as any).log);
-      if (!term.ok) { fail(6, term.error || "Terminology pass failed"); return; }
-      currentHtml = term.html;
-      mark(6, "done", "Terminology verified");
-      await sleep(BRIEF_CHECK_MS);
-
-      // 7. Human Natural Language Pass
-      mark(7, "running", "Rewriting for natural human English…");
-      const natural = await naturalLanguagePass({ data: { apiKey, html: currentHtml } });
-      addLog((natural as any).log);
-      if (!natural.ok) { fail(7, natural.error || "Natural language pass failed"); return; }
-      currentHtml = natural.html;
-      mark(7, "done", "Natural language applied");
-      await sleep(BRIEF_CHECK_MS);
-
-      // 8. Human Scannability Pass
-      mark(8, "running", "Optimizing for human scannability…");
-      const scan = await scannabilityPass({ data: { apiKey, html: currentHtml } });
-      addLog((scan as any).log);
-      if (!scan.ok) { fail(8, scan.error || "Scannability pass failed"); return; }
-      currentHtml = scan.html;
-      mark(8, "done", "Scannability improved");
-      await sleep(BRIEF_CHECK_MS);
-
-      // 9. Inject into Original Layout (already done via slots; confirm)
-      mark(9, "running", "Placing rewritten text into original HTML layout…");
-      mark(9, "done", "Original layout structure preserved");
-      await sleep(BRIEF_CHECK_MS);
-
-      // 10. Audit & QA
-      mark(10, "running", "Auditing content and HTML…");
-      const audited = await auditAndQA({ data: { apiKey, originalHtml: original, currentHtml, keywords: currentKeywords } });
-      addLog((audited as any).log);
-      if (!audited.ok) { fail(10, audited.error || "Audit failed"); return; }
-      currentHtml = audited.html;
-      mark(10, "done", `${(audited as any).flags?.length || 0} issues flagged`);
-      await sleep(BRIEF_CHECK_MS);
-
-      // 11. Final HTML
-      mark(11, "running", "Preparing final HTML…");
-      const cleaned = await cleanHtml({ data: { originalHtml: original, currentHtml } });
-      setFinalHtml(cleaned.html);
-      mark(11, "done", "Final HTML ready");
-      await sleep(BRIEF_CHECK_MS);
+      // 5–9. Score original → full rewrite → bold check & fix → score rewrite → final
+      const steps = await runScoreRewriteSteps(mem, stepDeps(mark, () => sleep(BRIEF_CHECK_MS)));
+      memoryRef.current = steps.mem;
+      if (!steps.ok) {
+        // Visible failure; no output is shown as if it were a rewrite.
+        if (steps.mem.before) setAudit(memoryToAudit(steps.mem));
+        toast.error(`Step ${steps.step} failed: ${steps.error}`);
+        return;
+      }
+      setAudit(memoryToAudit(steps.mem));
+      setFinalHtml(steps.mem.final_html);
+      for (const w of steps.warnings) toast.error(w);
       toast.success("Pipeline finished.");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "The pipeline failed.");
     } finally {
       setRunning(false);
     }
-  }, [busy, jobUrl, apiKey, resumeHtml, jobText, setJobUrl, setJobText, setKeywords, setAudit, setFinalHtml, setRunning, resetPipeline, mark, fail, toastBusy, addLog]);
+  }, [busy, jobUrl, apiKey, resumeHtml, jobText, setJobUrl, setJobText, setKeywords, setAudit, setFinalHtml, setRunning, resetPipeline, mark, fail, toastBusy, addLog, stepDeps]);
 
+  /**
+   * Rewrite button: runs the new path again (full rewrite → bold check & fix →
+   * score rewrite) from the run memory. The original's scores are reused.
+   */
   const onRewriteOutput = useCallback(async () => {
     if (busy) { toastBusy(); return; }
-    if (!finalHtml) { toast.error("Run the pipeline first so there is output to rewrite."); return; }
+    const mem = memoryRef.current;
+    if (!finalHtml || !mem || !mem.keywords) { toast.error("Run the pipeline first so there is output to rewrite."); return; }
     if (!isPlausibleApiKey(apiKey)) { toast.error("Save a Gemini API key first."); return; }
     setRewriting(true);
     try {
-      let kw = keywords;
-      if (!kw || (kw.keywords.length === 0 && kw.phrases.length === 0 && kw.must_have.length === 0 && kw.nice_to_have.length === 0)) {
-        const job = jobText.trim();
-        if (job.length < 40) {
-          toast.error("Keywords are missing and the job description text is too short to re-extract.");
-          return;
-        }
-        const extracted = await extractKeywords({ data: { apiKey, jobText: job } });
-        if (!extracted.ok) { toast.error(extracted.error); return; }
-        kw = extracted.keywords;
-        setKeywords(kw);
+      const steps = await runScoreRewriteSteps(mem, stepDeps(mark), { reuseBefore: true });
+      if (!steps.ok) {
+        toast.error(`Rewrite failed at step ${steps.step}: ${steps.error} The output shown is the previous version, unchanged.`);
+        return;
       }
-      const rewritten = await rewriteResume({ data: { apiKey, resumeHtml: finalHtml, keywords: kw } });
-      if (!rewritten.ok) { toast.error(rewritten.error); return; }
-      setFinalHtml(rewritten.html);
-      toast.success("Rewrite complete. Output updated.");
+      memoryRef.current = steps.mem;
+      setAudit(memoryToAudit(steps.mem));
+      setFinalHtml(steps.mem.final_html);
+      for (const w of steps.warnings) toast.error(w);
+      toast.success("Rewrite complete. Output and scores updated.");
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Rewrite failed.");
+      toast.error(`${err instanceof Error ? err.message : "Rewrite failed."} The output shown is the previous version, unchanged.`);
     } finally {
       setRewriting(false);
     }
-  }, [busy, finalHtml, apiKey, keywords, jobText, setKeywords, setFinalHtml, setRewriting, toastBusy]);
+  }, [busy, finalHtml, apiKey, mark, stepDeps, setAudit, setFinalHtml, setRewriting, toastBusy]);
 
   const onCustomizeOutput = useCallback(async (instructions: string, kind: DocKind) => {
     if (busy) { toastBusy(); return; }

@@ -25,7 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import type { AuditResult, KeywordSet } from "@/lib/pipeline-types";
+import { SCORE_KEYS, SCORE_LABELS, type AuditResult, type KeywordSet } from "@/lib/pipeline-types";
 import { useLanguage } from "@/lib/i18n/LanguageContext";
 
 export type DocKind = "resume" | "cover";
@@ -223,7 +223,7 @@ export function OutputPanel({
             downloadName="resume-ats.html"
             docTitle="resume-ats"
             emptyPreview="Preview appears after the pipeline finishes."
-            emptyHtml="Clean HTML appears in step 6."
+            emptyHtml="Clean HTML appears in step 9."
           />
         </TabsContent>
 
@@ -251,7 +251,7 @@ export function OutputPanel({
             <DocWorkspace
               html={coverHtml}
               keywords={keywords}
-              audit={audit}
+              audit={null}
               showPostActions={Boolean(pipelineComplete && coverHtml)}
               busy={busy}
               rewriting={rewriting}
@@ -557,6 +557,7 @@ function DocWorkspace({
         ) : (
           <EmptyNote text={emptyPreview} />
         )}
+        {audit?.before ? <ScoreReportText audit={audit} /> : null}
       </TabsContent>
 
       <TabsContent value="html">
@@ -609,4 +610,62 @@ function KeywordGroup({ title, items }: { title: string; items: string[] }) {
 
 function EmptyNote({ text }: { text: string }) {
   return <p className="text-sm text-muted-foreground">{text}</p>;
+}
+
+/**
+ * Plain-text score report shown under the preview. It is outside the iframe
+ * and outside the HTML, so Copy HTML / download / print never include it.
+ */
+function ScoreReportText({ audit }: { audit: AuditResult }) {
+  const fmt = (n: number | undefined) => (typeof n === "number" ? n.toFixed(1) : "—");
+  return (
+    <div className="mt-3 space-y-3 border-t pt-3 text-sm text-muted-foreground" aria-label="ATS score report">
+      <p className="font-medium text-foreground">ATS score report (0–10, one decimal). Not part of the copied HTML.</p>
+      {SCORE_KEYS.map((key) => {
+        const before = audit.before?.[key];
+        const after = audit.after?.[key];
+        const shown = after ?? before;
+        return (
+          <div key={key} className="space-y-1">
+            <p className="text-foreground">
+              {SCORE_LABELS[key]}: before {fmt(before?.score)} / after {fmt(after?.score)}
+            </p>
+            {shown && shown.facts.length > 0 ? (
+              <ul className="list-disc space-y-0.5 pl-5">
+                {shown.facts.map((f, i) => <li key={`f${i}`}>Fact: {f}</li>)}
+              </ul>
+            ) : null}
+            {shown && shown.suggestions.length > 0 ? (
+              <ul className="list-disc space-y-0.5 pl-5">
+                {shown.suggestions.map((t, i) => <li key={`s${i}`}>Suggestion: {t}</li>)}
+              </ul>
+            ) : null}
+          </div>
+        );
+      })}
+      {audit.bold ? (
+        <div className="space-y-1">
+          <p className="text-foreground">
+            Bold rule (code check): {audit.bold.passed}/{audit.bold.checked} lines pass after {audit.bold.loops} fix loop(s).
+          </p>
+          {audit.bold.failures.length > 0 ? (
+            <ul className="list-disc space-y-0.5 pl-5">
+              {audit.bold.failures.map((f) => (
+                <li key={f.index}>Still failing [{f.section}]: {f.text} — {f.problems.join(" ")}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+      {audit.flags.length > 0 ? (
+        <div className="space-y-1">
+          <p className="text-foreground">Fact flags (check before sending):</p>
+          <ul className="list-disc space-y-0.5 pl-5">
+            {audit.flags.map((f, i) => <li key={i}>{f.issue}{f.fix ? ` Fix: ${f.fix}` : ""}</li>)}
+          </ul>
+        </div>
+      ) : null}
+      {!audit.after ? <p>Scores of the rewrite are missing: that step failed (see the error message).</p> : null}
+    </div>
+  );
 }

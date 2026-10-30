@@ -52,7 +52,7 @@ export const en = {
   // Output
   output: "Output",
   noOutputYet: "No output yet",
-  saveKeyFirst: "Save an API key, add a job URL and your resume HTML, then run the six-step pipeline.",
+  saveKeyFirst: "Save an API key, add a job URL and your resume HTML, then run the nine-step pipeline.",
 
   // Support bot - language first
   pleaseSelectLanguage: "Please select your language",

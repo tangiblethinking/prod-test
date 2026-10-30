@@ -4,14 +4,14 @@
 Execute a hardened multi-agent pipeline to optimize a candidate's resume for ATS alignment against a job description while preserving 100% factual integrity. No fabrication of dates, titles, companies, metrics, or experiences.
 
 ## GLOBAL HUMAN VOICE STANDARD
-- Vary bullet length (roughly 8 to 28 words) and structure. Not every bullet starts with a past-tense verb or carries a metric. Max one metric per bullet; at least one bullet per role has no metric.
+- Vary bullet length (roughly 8 to 28 words) and structure. Not every bullet starts with a past-tense verb. Keep every metric from the original; never drop a number to vary the rhythm.
 - Older roles (5+ years ago) are shorter and plainer: fewer bullets, simpler vocabulary, less keyword density.
 - Banned unless in the candidate's own original wording and still natural: architected, spearheaded, leveraged, orchestrated, synergy, seamless, robust, cutting-edge, proven track record, passionate, dynamic, results-driven, ecosystem, matrix, hardened. No word opens more than two bullets in the whole resume.
 - No more than two job keywords per sentence. Keywords must read like something a person would say out loud.
 - Describe internal systems, agents, or tools in plain words, never by internal role names or system-prompt vocabulary.
 - Plain punctuation: no em-dash chains, no semicolon stacks; the "X, Y, and Z" triad at most once per role. Never produce double periods or other punctuation errors.
 - Summary: 2 to 3 short, clear sentences. First-person-implied. Concrete. No adjective stacks. Must read as natural spoken English.
-- Soft target: ~70% weighted coverage of MUST_PLACE items. Never trade voice or factuality for higher coverage.
+- Cover every MUST_PLACE item the resume has evidence for. Never trade voice or factuality for higher coverage.
 
 TECHNICAL TERM ACCURACY (mandatory — absolute)
 The original resume is the only source of facts. Do not invent how tools, libraries, or systems relate to each other.
@@ -85,10 +85,10 @@ Rules:
 ## CRITICAL SAFEGUARDS
 - Evidence-gated keyword integration only. Weave a JD term only when it truthfully describes work, tools, or outcomes already present on the resume.
 - Strict metric integrity (original numbers only).
-- Do not insert industry or domain words from the job description unless that same domain already appears on the resume.
+- Use the job description's industry or domain words when they describe work already on the resume; never attach them to work that is not there.
 - Zero repetition of signature phrases across roles.
 - Humanized, non-AI-slop phrasing.
-- Do not keyword-stuff. Skip a term if the resume does not already support it.
+- Do not keyword-stuff. Place each supported job term once, in the most relevant line; list unsupported terms as gaps instead of writing them in.
 - Layout: clean linear single column.
 - Alignment by relevance, not frequency.
 

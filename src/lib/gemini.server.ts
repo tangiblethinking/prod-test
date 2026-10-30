@@ -17,37 +17,61 @@ export type ChatResult =
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
 /**
- * Free-tier-friendly Flash / Flash-Lite models (Google AI Studio).
- * Tried in order until one succeeds (404 / not-found / quota → next).
- * Prefer Flash-Lite first for higher free RPM, then full Flash.
+ * Model order, tried until one succeeds.
+ * Sources (checked 2026-10-30):
+ *  - https://ai.google.dev/gemini-api/docs/models  (current model list; 2.5 models are
+ *    limited to projects that already used them, new projects should use 3.5 Flash-Lite / 3.8 Flash)
+ *  - https://ai.google.dev/gemini-api/docs/models/<model>  (each: input 1,048,576 tokens, output 65,536 tokens)
+ *  - https://ai.google.dev/gemini-api/docs/pricing  (all models below show a free tier)
+ *  - https://ai.google.dev/gemini-api/docs/rate-limits  (RPM / TPM / RPD per project, RPD resets
+ *    at midnight Pacific; exact free numbers are only shown in AI Studio)
+ * Strongest first: scoring and the full rewrite need the reasoning, and a 429 or a
+ * missing model simply moves on to the next one.
  */
-const FREE_TIER_MODELS = [
-  "gemini-2.5-flash-lite",
+export const FREE_TIER_MODELS = [
+  "gemini-3.8-flash",
   "gemini-2.5-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.5-flash",
   "gemini-3.6-flash",
+  "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
-  "gemini-3.7-flash",
+  "gemini-2.5-flash-lite",
 ] as const;
+
+/** Every model above has a 65,536 output-token limit (thinking tokens count toward it). */
+export const MAX_OUTPUT_TOKENS = 65536;
 
 function statusError(status: number): string {
   if (status === 400) {
-    return "The request was rejected. Check the API key and try again.";
+    return "The request was rejected (400).";
   }
   if (status === 401 || status === 403) {
     return "The Google API key was rejected. Create a free key at aistudio.google.com/apikey.";
   }
   if (status === 404) {
-    return "That Gemini model is not available on this key. Try another free Flash model or create a new key.";
+    return "That Gemini model is not available on this key.";
   }
   if (status === 429) {
-    return "Google free-tier rate limit hit. Wait a minute and run again (Flash-Lite has higher free RPM).";
+    return "Google rate limit hit (429) on every model tried. Wait a minute, or until midnight Pacific if the daily limit is used up, and run again.";
   }
   if (status >= 500) {
     return "The Gemini service is unavailable. Try again shortly.";
   }
   return `The API returned an error (${status}).`;
+}
+
+/** Reads Google's error body: message and the RetryInfo delay, if any. Never throws. */
+async function readErrorDetail(res: Response): Promise<{ message: string; retryDelaySec?: number }> {
+  try {
+    const body = (await res.json()) as {
+      error?: { message?: string; details?: { "@type"?: string; retryDelay?: string }[] };
+    };
+    const message = (body.error?.message ?? "").slice(0, 240);
+    const delay = body.error?.details?.find((d) => typeof d.retryDelay === "string")?.retryDelay;
+    const retryDelaySec = delay ? Number.parseFloat(delay) : undefined;
+    return { message, retryDelaySec: Number.isFinite(retryDelaySec) ? retryDelaySec : undefined };
+  } catch {
+    return { message: "" };
+  }
 }
 
 async function parseGenerateBody(res: Response): Promise<{ text: string; finishReason?: string }> {
@@ -88,6 +112,7 @@ function buildPayload(opts: {
   json?: boolean;
   urlContext?: boolean;
   images?: { mimeType: string; data: string }[];
+  responseSchema?: Record<string, unknown>;
 }): Record<string, unknown> {
   const systemParts = opts.messages
     .filter((m) => m.role === "system")
@@ -111,14 +136,14 @@ function buildPayload(opts: {
       };
     });
 
+  const wantsJson = Boolean(opts.json || opts.responseSchema);
   const payload: Record<string, unknown> = {
     contents,
     generationConfig: {
-      maxOutputTokens: opts.maxTokens,
+      maxOutputTokens: Math.max(1, Math.min(opts.maxTokens, MAX_OUTPUT_TOKENS)),
       temperature: opts.temperature,
-      ...(opts.json
-        ? { responseMimeType: "application/json" as const }
-        : {}),
+      ...(wantsJson ? { responseMimeType: "application/json" as const } : {}),
+      ...(opts.responseSchema ? { responseSchema: opts.responseSchema } : {}),
     },
   };
 
@@ -135,9 +160,14 @@ function buildPayload(opts: {
   return payload;
 }
 
+/** Exported for tests. */
+export { buildPayload as buildGeminiPayload };
+
 function estimateInputChars(messages: ChatMessage[]): number {
   return messages.reduce((n, m) => n + (m.content?.length ?? 0), 0);
 }
+
+const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export async function geminiChat(opts: {
   apiKey: string;
@@ -147,8 +177,24 @@ export async function geminiChat(opts: {
   json?: boolean;
   urlContext?: boolean;
   images?: { mimeType: string; data: string }[];
+  /** Structured output (OpenAPI-subset schema, generationConfig.responseSchema). */
+  responseSchema?: Record<string, unknown>;
+  /** Timeout for one HTTP request. Default 90 s. */
+  timeoutMs?: number;
+  /** Total time budget across all models and retries. Default 240 s. */
+  deadlineMs?: number;
+  /** Override the model order (tests). */
+  models?: readonly string[];
+  /** Wait before retrying (tests pass 0). */
+  backoffMs?: number;
 }): Promise<ChatResult> {
-  const payload = buildPayload(opts);
+  const started = Date.now();
+  const deadline = started + (opts.deadlineMs ?? 240_000);
+  const perRequest = opts.timeoutMs ?? 90_000;
+  const backoff = opts.backoffMs ?? 1500;
+  const models = opts.models ?? FREE_TIER_MODELS;
+  let payload = buildPayload(opts);
+  let schemaDropped = false;
   const inputChars = estimateInputChars(opts.messages);
   const headers = {
     "Content-Type": "application/json",
@@ -157,91 +203,94 @@ export async function geminiChat(opts: {
 
   let lastError = "Could not reach the model service.";
   let lastStatus: number | undefined;
+  let lastModel: string | undefined;
 
-  for (const model of FREE_TIER_MODELS) {
+  for (const model of models) {
+    lastModel = model;
     const url = `${GEMINI_BASE}/models/${model}:generateContent`;
-    let res: Response;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 90000);
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      if (err instanceof Error && err.name === "AbortError") {
-        lastError = "The model took too long to respond. Try again.";
-        continue;
-      }
-      lastError = "Could not reach the model service.";
-      continue;
-    }
-
-    // Retry with backoff on 5xx or 429 (free-tier overload / rate limit)
-    const retryable = !res.ok && (res.status >= 500 || res.status === 429);
-    if (retryable) {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        await new Promise((r) => setTimeout(r, 1200 * attempt));
-        try {
-          res = await fetch(url, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(payload),
-          });
-          if (res.ok) break;
-          if (res.status < 500 && res.status !== 429) break;
-        } catch {
-          lastError = "Could not reach the model service.";
-        }
-      }
-    }
-
-    clearTimeout(timeoutId);
-    if (res.ok) {
-      try {
-        const { text, finishReason } = await parseGenerateBody(res);
-        return {
-          ok: true,
-          text,
-          meta: {
-            model,
-            finishReason,
-            inputChars,
-            outputChars: text.length,
-          },
-        };
-      } catch (err) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining < 2000) {
         return {
           ok: false,
-          error:
-            err instanceof Error
-              ? err.message
-              : "The model response could not be read.",
-          meta: { model, inputChars, outputChars: 0 },
+          error: `Stopped after ${Math.round((Date.now() - started) / 1000)} s (time budget used). Last error: ${lastError}`,
+          status: lastStatus,
+          meta: { model: lastModel, inputChars, outputChars: 0 },
         };
       }
+      const controller = new AbortController();
+      const waitMs = Math.min(perRequest, remaining);
+      const timeoutId = setTimeout(() => controller.abort(), waitMs);
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        clearTimeout(timeoutId);
+        lastError = err instanceof Error && err.name === "AbortError"
+          ? `${model} did not answer within ${Math.round(waitMs / 1000)} s.`
+          : "Could not reach the model service.";
+        break; // next model
+      }
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        try {
+          const { text, finishReason } = await parseGenerateBody(res);
+          return {
+            ok: true,
+            text,
+            meta: { model, finishReason, inputChars, outputChars: text.length },
+          };
+        } catch (err) {
+          // Empty or unreadable answer (for example all output spent on thinking): next model.
+          lastError = `${model}: ${err instanceof Error ? err.message : "The model response could not be read."}`;
+          break;
+        }
+      }
+
+      lastStatus = res.status;
+      const detail = await readErrorDetail(res);
+      lastError = `${model}: ${statusError(res.status)}${detail.message ? ` ${detail.message}` : ""}`;
+
+      if (res.status === 401) {
+        return { ok: false, error: statusError(401), status: 401, meta: { model, inputChars, outputChars: 0 } };
+      }
+      if ((res.status === 400 || res.status === 403) && /api[ _-]?key/i.test(detail.message)) {
+        return { ok: false, error: statusError(403), status: res.status, meta: { model, inputChars, outputChars: 0 } };
+      }
+      // Structured output rejected: retry the same model once with plain JSON mode.
+      if (res.status === 400 && opts.responseSchema && !schemaDropped) {
+        payload = buildPayload({ ...opts, responseSchema: undefined, json: true });
+        schemaDropped = true;
+        continue;
+      }
+      if (res.status === 429) {
+        const delaySec = detail.retryDelaySec ?? 0;
+        // Short per-minute limit: wait and retry this model; long or daily: next model.
+        if (attempt < 2 && delaySec <= 20 && deadline - Date.now() > delaySec * 1000 + 5000) {
+          await sleepMs(delaySec > 0 ? delaySec * 1000 : backoff * (attempt + 1));
+          continue;
+        }
+        break;
+      }
+      if (res.status >= 500) {
+        if (attempt < 2) {
+          await sleepMs(backoff * (attempt + 1));
+          continue;
+        }
+        break;
+      }
+      // 400 / 403 / 404: model not available on this key → next model.
+      break;
     }
-
-    lastStatus = res.status;
-    lastError = statusError(res.status);
-
-    // Auth failures are not model-specific — stop trying
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: lastError, status: res.status, meta: { model, inputChars, outputChars: 0 } };
-    }
-
-    // 404 / 400 (model unavailable) or 429 (quota on this model) → try next free model
-    if (res.status === 404 || res.status === 400 || res.status === 429) {
-      continue;
-    }
-
-    return { ok: false, error: lastError, status: res.status, meta: { model, inputChars, outputChars: 0 } };
   }
 
-  return { ok: false, error: lastError, status: lastStatus };
+  return { ok: false, error: lastError, status: lastStatus, meta: { model: lastModel, inputChars, outputChars: 0 } };
 }
 
 /**

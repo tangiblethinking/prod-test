@@ -25,45 +25,33 @@ export const PIPELINE_STEPS = [
   },
   {
     id: 5,
-    key: "rewrite",
-    title: "Keyword Injection Rewrite",
-    blurb: "Rewrite existing language to inject keywords and phrases without falsifying.",
+    key: "score-original",
+    title: "Score Original",
+    blurb: "Score the submitted resume on the five ATS and reviewer measures, with facts and suggestions.",
   },
   {
     id: 6,
-    key: "terminology",
-    title: "Terminology Accuracy Pass",
-    blurb: "Ensure technical language is accurate and makes real-world sense.",
+    key: "full-rewrite",
+    title: "Full Rewrite",
+    blurb: "Rewrite the whole resume from the job, intent, keywords, resume facts and score suggestions.",
   },
   {
     id: 7,
-    key: "natural",
-    title: "Human Natural Language Pass",
-    blurb: "Rewrite into natural language a person would write.",
+    key: "bold-check",
+    title: "Bold Rule Check & Fix",
+    blurb: "Code check of the dual-anchor bold rule; failing lines go back to the model (max 2 loops).",
   },
   {
     id: 8,
-    key: "scannability",
-    title: "Human Scannability Pass",
-    blurb: "Ensure the most important points are quickly scannable by a human.",
+    key: "score-rewrite",
+    title: "Score Rewrite",
+    blurb: "Score the rewrite on the same five measures and list what is still missing.",
   },
   {
     id: 9,
-    key: "inject",
-    title: "Inject into Original Layout",
-    blurb: "Place the rewritten text back into the original HTML structure.",
-  },
-  {
-    id: 10,
-    key: "audit",
-    title: "Audit & QA",
-    blurb: "Full content and code quality check.",
-  },
-  {
-    id: 11,
     key: "final",
     title: "Final HTML",
-    blurb: "Deliver the cleaned final resume HTML.",
+    blurb: "Deliver the copy-ready resume HTML.",
   },
 ] as const;
 
@@ -90,6 +78,63 @@ export type AuditResult = {
   keyword_counts: Record<string, number>;
   match_percentage?: number;
   skill_gaps?: string[];
+  /** Scores of the submitted resume (step 5). */
+  before?: ScoreReport;
+  /** Scores of the rewrite (step 8). */
+  after?: ScoreReport;
+  /** Result of the code-only bold check after the fix loops (step 7). */
+  bold?: { checked: number; passed: number; loops: number; failures: BoldFailure[] };
+  /** Code-only fact check: numbers or headings in the rewrite that are not in the original. */
+  fact_flags?: AuditFlag[];
+};
+
+/* ───── Scoring ───── */
+
+export const SCORE_KEYS = [
+  "ats_engine_readiness",
+  "job_fit",
+  "ai_written_likelihood",
+  "ats_pass_to_human_chance",
+  "human_scannability",
+] as const;
+export type ScoreKey = (typeof SCORE_KEYS)[number];
+
+export const SCORE_LABELS: Record<ScoreKey, string> = {
+  ats_engine_readiness: "ATS engine readiness",
+  job_fit: "Fit to the job description",
+  ai_written_likelihood: "How heavily AI-written (higher = more AI-like)",
+  ats_pass_to_human_chance: "Chance of passing the ATS into human review",
+  human_scannability: "Human scannability",
+};
+
+/** One score: 0.0–10.0, one decimal, with the facts that prove it and every suggestion. */
+export type ScoreItem = { score: number; facts: string[]; suggestions: string[] };
+
+export type ScoreReport = Record<ScoreKey, ScoreItem> & {
+  fabrication_flags: AuditFlag[];
+};
+
+/** One summary/bullet/competency line that fails the dual-anchor bold rule. */
+export type BoldFailure = { index: number; section: string; text: string; problems: string[] };
+
+/**
+ * Run memory. Created at the start of a run and kept in the browser. Each
+ * step adds its result; each server call gets only the fields it needs.
+ */
+export type RunMemory = {
+  original_html: string;
+  job_url: string;
+  job_text: string;
+  intent: string;
+  priorities: string[];
+  keywords: KeywordSet | null;
+  resume_facts: unknown;
+  before: ScoreReport | null;
+  draft_html: string | null;
+  final_html: string | null;
+  after: ScoreReport | null;
+  bold: AuditResult["bold"] | null;
+  fact_flags: AuditFlag[];
 };
 
 export const API_KEY_STORAGE = "ats-align.gemini-api-key";

@@ -25,18 +25,20 @@ export function assertPublicHttpUrl(raw: string): string {
   return url.toString();
 }
 
-function decodeEntities(text: string): string {
+function safeCodePoint(code: number): string {
+  return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
+}
+
+export function decodeEntities(text: string): string {
   return text
     .replace(/&nbsp;/gi, " ")
-    .replace(/&/gi, "&")
-    .replace(/</gi, "<")
-    .replace(/>/gi, ">")
-    .replace(/&#39;/gi, "'")
-    .replace(/"/gi, '"')
-    .replace(/&#(\d+);/g, (_, n: string) => {
-      const code = Number(n);
-      return Number.isFinite(code) ? String.fromCharCode(code) : "";
-    });
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => safeCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, n: string) => safeCodePoint(Number(n)))
+    .replace(/&amp;/gi, "&");
 }
 
 export function htmlToText(html: string): string {
@@ -100,7 +102,7 @@ function extractJobPosting(html: string): string | null {
             ? String((rec.hiringOrganization as { name?: string }).name ?? "")
             : "";
         const description =
-          typeof rec.description === "string" ? htmlToText(rec.description) : "";
+          typeof rec.description === "string" ? htmlToText(decodeEntities(rec.description)) : "";
         const parts = [
           rec.title,
           org,
