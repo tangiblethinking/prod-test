@@ -86,7 +86,7 @@ export function SearchApp({
     let cancel = false;
     (async () => {
       try {
-        const response = await fetch("/companies.json");
+        const response = await fetch(`${import.meta.env.BASE_URL}companies.json`);
         if (!response.ok) throw new Error("status");
         const base = parseCompanies(await response.json());
         const store = loadStore();

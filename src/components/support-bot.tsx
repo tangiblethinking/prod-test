@@ -381,7 +381,7 @@ export function SupportBot({ apiKey, onApiKeyChange }: Props) {
                 }}
               >
                 <video
-                  src="/mascot/supportbot-mascot-original.mp4"
+                  src="/jobs/mascot/supportbot-mascot-original.mp4"
                   autoPlay
                   loop
                   muted

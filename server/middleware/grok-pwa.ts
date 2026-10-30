@@ -70,12 +70,10 @@ export default async function grokPwaMiddleware(
   const path = event.url.pathname;
   const urlWithQuery = path + event.url.search;
 
-  // When served under base /job (uxapex.com/job), pathname may include the prefix
-  // if the upstream rewrite does not strip it.
-  const pathNoBase =
-    path === "/job" || path.startsWith("/job/")
-      ? path.slice("/job".length) || "/"
-      : path;
+  // When served under base /jobs (uxapex.com/jobs) — or the older /job — the
+  // pathname may include the prefix if the upstream rewrite does not strip it.
+  const basePrefix = /^\/jobs?(?=\/|$)/.exec(path)?.[0] ?? "";
+  const pathNoBase = basePrefix ? path.slice(basePrefix.length) || "/" : path;
 
   if (
     pathNoBase === "/__grok/manifest.webmanifest" ||
